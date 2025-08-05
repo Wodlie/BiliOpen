@@ -1,4 +1,4 @@
->由于b站更新api，BiliOpen已失效，本存储库仅作为学习参考。
+>由于b站停用了相簿以及相关api，BiliOpen已失效，本存储库仅作为学习参考。
 
 <h1 align="center">- BiliOpen -</h1>
 
