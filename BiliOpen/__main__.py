@@ -16,16 +16,169 @@ import threading
 import time
 import traceback
 import types
-from BiliDrive import __version__
-from BiliDrive.bilibili import Bilibili
+import zlib
+import io
+from PIL import Image
+from BiliOpen import __version__
+from BiliOpen.bilibili import Bilibili
 
 log = Bilibili._log
 
 bundle_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 
-default_url = lambda sha1: f"http://i0.hdslb.com/bfs/album/{sha1}.x-ms-bmp"
-meta_string = lambda url: ("bdrive://" + re.findall(r"[a-fA-F0-9]{40}", url)[0]) if re.match(r"^http(s?)://i0.hdslb.com/bfs/album/[a-fA-F0-9]{40}.x-ms-bmp$", url) else url
+default_url = lambda sha1: f"http://i0.hdslb.com/bfs/openplatform/{sha1}.png"
+meta_string = lambda url: ("biliopen://" + re.findall(r"[a-fA-F0-9]{40}", url)[0]) if re.match(r"^http(s?)://i0.hdslb.com/bfs/openplatform/[a-fA-F0-9]{40}.png$", url) else url
 size_string = lambda byte: f"{byte / 1024 / 1024 / 1024:.2f} GB" if byte > 1024 * 1024 * 1024 else f"{byte / 1024 / 1024:.2f} MB" if byte > 1024 * 1024 else f"{byte / 1024:.2f} KB" if byte > 1024 else f"{int(byte)} B"
+
+def create_carrier_image(width=8000, height=6000):
+    """创建载体图像"""
+    img = Image.new('RGB', (width, height), color='black')
+    return img
+
+def hide_data_in_png(data, chunk_prefix='ziPd', background_image=None):
+    """
+    将数据隐藏到PNG图像中
+    :param data: 要隐藏的二进制数据
+    :param chunk_prefix: 自定义块前缀（必须4字符）
+    :param background_image: 背景图像路径或二进制数据，如果为None则使用默认黑色背景
+    :return: 包含隐藏数据的PNG二进制
+    """
+    # 获取载体图像的PNG数据
+    if background_image is None:
+        # 创建默认载体图像
+        carrier_img = create_carrier_image()
+        png_buffer = io.BytesIO()
+        carrier_img.save(png_buffer, format='PNG')
+        png_data = png_buffer.getvalue()
+    elif isinstance(background_image, str):
+        # 从文件路径读取PNG图像
+        try:
+            with open(background_image, 'rb') as f:
+                png_data = f.read()
+            # 验证是否为有效PNG文件
+            if not png_data.startswith(b'\x89PNG\r\n\x1a\n'):
+                raise ValueError(f"指定的文件不是有效的PNG格式: {background_image}")
+        except Exception as e:
+            raise ValueError(f"无法读取背景图像文件 {background_image}: {e}")
+    elif isinstance(background_image, bytes):
+        # 直接使用二进制数据
+        png_data = background_image
+        if not png_data.startswith(b'\x89PNG\r\n\x1a\n'):
+            raise ValueError("提供的背景图像数据不是有效的PNG格式")
+    else:
+        raise ValueError("background_image必须是文件路径(str)、二进制数据(bytes)或None")
+    
+    # PNG文件签名和关键块标识
+    PNG_SIGNATURE = b'\x89PNG\r\n\x1a\n'
+    IHDR = b'IHDR'
+    IDAT = b'IDAT'
+    IEND = b'IEND'
+    
+    # 查找关键块位置
+    pos = len(PNG_SIGNATURE)
+    chunks = []
+    idat_end = None
+    
+    # 解析现有块
+    while pos < len(png_data):
+        # 读取块长度和类型
+        chunk_len = struct.unpack('>I', png_data[pos:pos+4])[0]
+        chunk_type = png_data[pos+4:pos+8]
+        chunk_end = pos + 8 + chunk_len + 4  # +4为CRC
+        
+        # 记录所有块
+        chunks.append((chunk_type, png_data[pos:chunk_end]))
+        
+        # 记录最后一个IDAT块结束位置
+        if chunk_type == IDAT:
+            idat_end = chunk_end
+        
+        pos = chunk_end
+    
+    if idat_end is None:
+        raise ValueError("无效的PNG文件：未找到IDAT块")
+    
+    # 分割数据到多个自定义块
+    chunk_size = 65535 - 4  # 留4字节给chunk序号
+    data_chunks = []
+    chunk_num = 1
+    
+    for i in range(0, len(data), chunk_size):
+        # 使用固定的chunk type name
+        chunk_type_name = chunk_prefix.encode('ascii')[:4].ljust(4, b'\x00')
+        
+        # 获取当前数据段
+        current_data = data[i:i+chunk_size]
+        
+        # 在数据前添加4字节的chunk序号
+        chunk_data = struct.pack('>I', chunk_num) + current_data
+        
+        # 计算CRC（块类型+数据）
+        crc = zlib.crc32(chunk_type_name + chunk_data) & 0xFFFFFFFF
+        
+        # 构建完整块 [长度(4) + 类型(4) + 数据(n) + CRC(4)]
+        chunk = struct.pack('>I', len(chunk_data)) + chunk_type_name + chunk_data + struct.pack('>I', crc)
+        data_chunks.append(chunk)
+        chunk_num += 1
+    
+    # 构建新PNG文件
+    new_png = bytearray(PNG_SIGNATURE)
+    
+    # 插入原始块直到最后一个IDAT之后
+    for chunk_type, chunk_data in chunks:
+        new_png.extend(chunk_data)
+        if chunk_type == IDAT:
+            # 在最后一个IDAT后插入自定义块
+            for data_chunk in data_chunks:
+                new_png.extend(data_chunk)
+    
+    return bytes(new_png)
+
+def extract_data_from_png(png_data, chunk_prefix='ziPd'):
+    """
+    从PNG文件中提取隐藏的数据
+    :param png_data: PNG二进制数据
+    :param chunk_prefix: 自定义块前缀（必须4字符）
+    :return: 提取的二进制数据
+    """
+    # PNG文件签名
+    PNG_SIGNATURE = b'\x89PNG\r\n\x1a\n'
+    if not png_data.startswith(PNG_SIGNATURE):
+        raise ValueError("无效的PNG文件")
+    
+    # 查找关键块位置
+    pos = len(PNG_SIGNATURE)
+    custom_chunks = {}  # 用字典存储，键为块编号，值为数据
+    custom_type = chunk_prefix.encode('ascii')[:4].ljust(4, b'\x00')
+    
+    # 遍历所有块
+    while pos < len(png_data):
+        # 读取块长度和类型
+        chunk_len = struct.unpack('>I', png_data[pos:pos+4])[0]
+        chunk_type = png_data[pos+4:pos+8]
+        chunk_start = pos + 8
+        chunk_end = chunk_start + chunk_len
+        crc = png_data[chunk_end:chunk_end+4]
+        
+        # 检查是否自定义块
+        if chunk_type == custom_type:
+            # 获取块数据
+            chunk_data = png_data[chunk_start:chunk_end]
+            if len(chunk_data) >= 4:
+                # 前4字节是chunk序号
+                chunk_num = struct.unpack('>I', chunk_data[:4])[0]
+                actual_data = chunk_data[4:]
+                custom_chunks[chunk_num] = actual_data
+        
+        # 移动到下一个块
+        pos = chunk_end + 4
+    
+    # 按编号顺序重建数据
+    extracted_data = bytearray()
+    for chunk_num in sorted(custom_chunks.keys()):
+        extracted_data.extend(custom_chunks[chunk_num])
+    
+    return bytes(extracted_data)
 
 def bmp_header(data):
     return b"BM" \
@@ -56,32 +209,48 @@ def calc_sha1(data, hexdigest=False):
     return sha1.hexdigest() if hexdigest else sha1.digest()
 
 def fetch_meta(string):
-    if re.match(r"^bdrive://[a-fA-F0-9]{40}$", string) or re.match(r"^[a-fA-F0-9]{40}$", string):
+    if re.match(r"^biliopen://[a-fA-F0-9]{40}$", string) or re.match(r"^[a-fA-F0-9]{40}$", string):
         full_meta = image_download(default_url(re.findall(r"[a-fA-F0-9]{40}", string)[0]))
     elif string.startswith("http://") or string.startswith("https://"):
         full_meta = image_download(string)
     else:
         return None
     try:
-        meta_dict = json.loads(full_meta[62:].decode("utf-8"))
+        # For PNG format, extract data from custom chunks
+        meta_data = extract_data_from_png(full_meta, chunk_prefix='ziPd')
+        meta_dict = json.loads(meta_data.decode("utf-8"))
         return meta_dict
     except:
-        return None
+        # Fallback to old BMP format for backward compatibility
+        try:
+            meta_dict = json.loads(full_meta[62:].decode("utf-8"))
+            return meta_dict
+        except:
+            return None
 
 def image_upload(data, cookies):
-    url = "https://api.vc.bilibili.com/api/v1/drawImage/upload"
+    url = "https://api.bilibili.com/x/upload/web/image"
     headers = {
-        'Origin': "https://t.bilibili.com",
-        'Referer': "https://t.bilibili.com/",
         'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.79 Safari/537.36",
     }
+    
+    # Extract CSRF token from bili_jct cookie
+    csrf_token = cookies.get('bili_jct', '')
+    if not csrf_token:
+        log("错误：无法从cookie中获取bili_jct字段，请检查cookie是否完整")
+        return None
+    
     files = {
-        'file_up': (f"{int(time.time() * 1000)}.bmp", data),
-        'biz': "draw",
-        'category': "daily",
+        'file': (f"{int(time.time() * 1000)}.png", data, 'image/png'),
     }
+    
+    form_data = {
+        'bucket': 'openplatform',
+        'csrf': csrf_token,
+    }
+    
     try:
-        response = requests.post(url, headers=headers, cookies=cookies, files=files, timeout=300).json()
+        response = requests.post(url, headers=headers, cookies=cookies, files=files, data=form_data).json()
     except:
         response = None
     return response
@@ -122,18 +291,57 @@ def read_in_chunk(file_name, chunk_size=16 * 1024 * 1024, chunk_number=-1):
             else:
                 return
 
-def login_handle(args):
-    bilibili = Bilibili()
-    if bilibili.login(username=args.username, password=args.password):
-        bilibili.get_user_info()
-        with open(os.path.join(bundle_dir, "cookies.json"), "w", encoding="utf-8") as f:
-            f.write(json.dumps(bilibili.get_cookies(), ensure_ascii=False, indent=2))
+def load_cookies_from_file():
+    """Load cookies from cookie.txt file in HEADER STRING format"""
+    cookie_file = "cookie.txt"  # Use current working directory
+    
+    if not os.path.exists(cookie_file):
+        log("未找到cookie.txt文件，请创建该文件并填入有效的cookie")
+        log("cookie格式为HEADER STRING，例如：")
+        log("SESSDATA=xxx; bili_jct=xxx")
+        return None
+    
+    try:
+        with open(cookie_file, "r", encoding="utf-8") as f:
+            cookie_string = f.read().strip()
+        
+        if not cookie_string:
+            log("cookie.txt文件为空，请填入有效的cookie")
+            log("cookie格式为HEADER STRING，例如：")
+            log("SESSDATA=xxx; bili_jct=xxx")
+            return None
+        
+        # Parse cookie string into dictionary
+        cookies = {}
+        for cookie_pair in cookie_string.split(';'):
+            cookie_pair = cookie_pair.strip()
+            if '=' in cookie_pair:
+                key, value = cookie_pair.split('=', 1)
+                cookies[key.strip()] = value.strip()
+        
+        # Validate that essential cookies are present
+        essential_cookies = ['SESSDATA', 'bili_jct']
+        missing_cookies = [cookie for cookie in essential_cookies if cookie not in cookies]
+        
+        if missing_cookies:
+            log(f"cookie中缺少必要字段: {', '.join(missing_cookies)}")
+            log("请确保cookie包含SESSDATA, bili_jct等必要字段")
+            return None
+        
+        return cookies
+        
+    except Exception as e:
+        log(f"读取cookie.txt文件失败: {e}")
+        log("请检查文件格式是否正确，cookie格式为HEADER STRING")
+        return None
+
+
 
 def upload_handle(args):
     def core(index, block):
         try:
             block_sha1 = calc_sha1(block, hexdigest=True)
-            full_block = bmp_header(block) + block
+            full_block = hide_data_in_png(block, chunk_prefix='ziPd', background_image=args.picture)
             full_block_sha1 = calc_sha1(full_block, hexdigest=True)
             url = is_skippable(full_block_sha1)
             if url:
@@ -151,7 +359,7 @@ def upload_handle(args):
                     response = image_upload(full_block, cookies)
                     if response:
                         if response['code'] == 0:
-                            url = response['data']['image_url']
+                            url = response['data']['location']
                             log(f"分块{index + 1}/{block_num}上传完毕")
                             block_dict[index] = {
                                 'url': url,
@@ -209,11 +417,8 @@ def upload_handle(args):
         log(f"文件已于{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(history[first_4mb_sha1]['time']))}上传, 共有{len(history[first_4mb_sha1]['block'])}个分块")
         log(f"META URL -> {meta_string(url)}")
         return url
-    try:
-        with open(os.path.join(bundle_dir, "cookies.json"), "r", encoding="utf-8") as f:
-            cookies = json.loads(f.read())
-    except:
-        log("Cookies加载失败, 请先登录")
+    cookies = load_cookies_from_file()
+    if cookies is None:
         return None
     log(f"线程数: {args.thread}")
     done_flag = threading.Semaphore(0)
@@ -243,11 +448,11 @@ def upload_handle(args):
         'block': [block_dict[i] for i in range(len(block_dict))],
     }
     meta = json.dumps(meta_dict, ensure_ascii=False).encode("utf-8")
-    full_meta = bmp_header(meta) + meta
+    full_meta = hide_data_in_png(meta, chunk_prefix='ziPd', background_image=args.picture)
     for _ in range(10):
         response = image_upload(full_meta, cookies)
         if response and response['code'] == 0:
-            url = response['data']['image_url']
+            url = response['data']['location']
             log("元数据上传完毕")
             log(f"{meta_dict['filename']} ({size_string(meta_dict['size'])}) 上传完毕, 用时{time.time() - start_time:.1f}秒, 平均速度{size_string(meta_dict['size'] / (time.time() - start_time))}/s")
             log(f"META URL -> {meta_string(url)}")
@@ -266,11 +471,17 @@ def download_handle(args):
                     return
                 block = image_download(block_dict['url'])
                 if block:
-                    block = block[62:]
-                    if calc_sha1(block, hexdigest=True) == block_dict['sha1']:
+                    # Try PNG format first
+                    try:
+                        block_data = extract_data_from_png(block, chunk_prefix='ziPd')
+                    except:
+                        # Fallback to old BMP format for backward compatibility
+                        block_data = block[62:]
+                    
+                    if calc_sha1(block_data, hexdigest=True) == block_dict['sha1']:
                         file_lock.acquire()
                         f.seek(block_offset(index))
-                        f.write(block)
+                        f.write(block_data)
                         file_lock.release()
                         log(f"分块{index + 1}/{len(meta_dict['block'])}下载完毕")
                         return
@@ -377,17 +588,14 @@ def history_handle(args):
 
 def main():
     signal.signal(signal.SIGINT, lambda signum, frame: os.kill(os.getpid(), 9))
-    parser = argparse.ArgumentParser(prog="BiliDrive", description="Make Bilibili A Great Cloud Storage!", formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("-v", "--version", action="version", version=f"BiliDrive version: {__version__}")
+    parser = argparse.ArgumentParser(prog="BiliOpen", description="Make Bilibili A Great Cloud Storage!", formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("-v", "--version", action="version", version=f"BiliOpen version: {__version__}")
     subparsers = parser.add_subparsers()
-    login_parser = subparsers.add_parser("login", help="log in to bilibili")
-    login_parser.add_argument("username", help="your bilibili username")
-    login_parser.add_argument("password", help="your bilibili password")
-    login_parser.set_defaults(func=login_handle)
     upload_parser = subparsers.add_parser("upload", help="upload a file")
     upload_parser.add_argument("file", help="name of the file to upload")
     upload_parser.add_argument("-b", "--block-size", default=4, type=int, help="block size in MB")
     upload_parser.add_argument("-t", "--thread", default=4, type=int, help="upload thread number")
+    upload_parser.add_argument("-p", "--picture", help="path to custom PNG background image (optional)")
     upload_parser.set_defaults(func=upload_handle)
     download_parser = subparsers.add_parser("download", help="download a file")
     download_parser.add_argument("meta", help="meta url")
@@ -403,7 +611,7 @@ def main():
     shell = False
     while True:
         if shell:
-            args = shlex.split(input("BiliDrive > "))
+            args = shlex.split(input("BiliOpen > "))
             try:
                 args = parser.parse_args(args)
                 args.func(args)

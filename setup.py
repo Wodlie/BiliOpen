@@ -2,20 +2,56 @@
 # -*- coding: utf-8 -*-
 
 import setuptools
-import BiliDrive
+import os
+import re
+
+# Read version from __init__.py without importing the module
+def get_version():
+    init_file = os.path.join(os.path.dirname(__file__), "BiliOpen", "__init__.py")
+    with open(init_file, "r", encoding="utf-8") as f:
+        content = f.read()
+    version_match = re.search(r'^__version__\s*=\s*[\'"]([^\'"]*)[\'"]', content, re.MULTILINE)
+    if version_match:
+        return version_match.group(1)
+    raise RuntimeError("Unable to find version string.")
+
+# Read author and email from __init__.py without importing the module
+def get_author_info():
+    init_file = os.path.join(os.path.dirname(__file__), "BiliOpen", "__init__.py")
+    with open(init_file, "r", encoding="utf-8") as f:
+        content = f.read()
+    
+    author_match = re.search(r'^__author__\s*=\s*[\'"]([^\'"]*)[\'"]', content, re.MULTILINE)
+    email_match = re.search(r'^__email__\s*=\s*[\'"]([^\'"]*)[\'"]', content, re.MULTILINE)
+    
+    author = author_match.group(1) if author_match else "Unknown"
+    email = email_match.group(1) if email_match else "unknown@example.com"
+    
+    return author, email
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
-with open("requirements.txt", "r", encoding="utf-8") as fh:
-    install_requires = fh.read().splitlines()
+# Read requirements from file if it exists, otherwise use hardcoded list
+try:
+    with open("requirements.txt", "r", encoding="utf-8") as fh:
+        install_requires = fh.read().splitlines()
+except FileNotFoundError:
+    # Fallback to hardcoded dependencies
+    install_requires = [
+        "requests",
+        "Pillow", 
+        "numpy"
+    ]
+
+author, email = get_author_info()
 
 setuptools.setup(
-    name="BiliDrive",
-    version=BiliDrive.__version__,
-    url="https://github.com/Hsury/BiliDrive",
-    author=BiliDrive.__author__,
-    author_email=BiliDrive.__email__,
+    name="BiliOpen",
+    version=get_version(),
+    url="https://github.com/Wodlie/BiliOpen",
+    author=author,
+    author_email=email,
     classifiers=[
         "Development Status :: 4 - Beta",
         "Environment :: Console",
@@ -30,7 +66,7 @@ setuptools.setup(
         "Topic :: Internet :: WWW/HTTP",
         "Topic :: Utilities",
     ],
-    description="☁️ 哔哩哔哩云，支持任意文件的全速上传与下载",
+    description="☁️ 哔哩开放云，支持任意文件的全速上传与下载",
     long_description=long_description,
     long_description_content_type="text/markdown",
     keywords=[
@@ -43,14 +79,13 @@ setuptools.setup(
         "yun",
         "B站",
         "哔哩哔哩",
-        "网盘",
-        "云",
+        "网盘"
     ],
     install_requires=install_requires,
     python_requires=">=3.6",
     entry_points={
         'console_scripts': [
-            "BiliDrive=BiliDrive.__main__:main",
+            "BiliOpen=BiliOpen.__main__:main",
         ],
     },
     packages=setuptools.find_packages(),
