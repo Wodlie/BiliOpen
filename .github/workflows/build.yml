@@ -1,0 +1,139 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  release:
+    types: [ created ]
+
+env:
+  RELEASE_VERSION: v2.0.0
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-20.04
+            arch: amd64
+            python-version: '3.7.5'
+            release-name: biliopen-${{ env.RELEASE_VERSION }}-linux-amd64.tar.gz
+            archive-cmd: tar -czvf
+          - os: ubuntu-20.04
+            arch: arm64
+            python-version: '3.7.5'
+            release-name: biliopen-${{ env.RELEASE_VERSION }}-linux-arm64.tar.gz
+            archive-cmd: tar -czvf
+            # Note: ARM64 builds on GitHub Actions require self-hosted runners
+          - os: macos-11
+            arch: amd64
+            python-version: '3.7.4'
+            release-name: biliopen-${{ env.RELEASE_VERSION }}-macos-amd64.zip
+            archive-cmd: zip -r
+          - os: windows-2019
+            arch: amd64
+            python-version: '3.7.5'
+            release-name: biliopen-${{ env.RELEASE_VERSION }}-windows-amd64.zip
+            archive-cmd: 7z a -tzip
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+
+    - name: Test application
+      run: python -m BiliOpen -v
+
+    - name: Build executable
+      run: |
+        pyinstaller -F -n BiliOpen -i icon.ico BiliOpen/__main__.py
+
+    - name: Prepare release files
+      shell: bash
+      run: |
+        mkdir -p release/BiliOpen
+        if [ "${{ runner.os }}" = "Windows" ]; then
+          cp dist/BiliOpen.exe release/BiliOpen/
+        else
+          cp dist/BiliOpen release/BiliOpen/
+        fi
+        cp LICENSE README.md release/BiliOpen/
+
+    - name: Create archive
+      shell: bash
+      working-directory: release
+      run: |
+        if [ "${{ runner.os }}" = "Windows" ]; then
+          7z a -tzip ${{ matrix.release-name }} BiliOpen
+        elif [ "${{ runner.os }}" = "macOS" ]; then
+          zip -r ${{ matrix.release-name }} BiliOpen
+        else
+          tar -czvf ${{ matrix.release-name }} BiliOpen
+        fi
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: ${{ matrix.release-name }}
+        path: release/${{ matrix.release-name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+      with:
+        path: artifacts
+
+    - name: Upload release assets
+      uses: softprops/action-gh-release@v1
+      with:
+        files: artifacts/*/*.tar.gz,artifacts/*/*.zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.7.5'
+
+    - name: Install build dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install build twine
+
+    - name: Build package
+      run: python -m build
+
+    - name: Publish to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        password: ${{ secrets.PYPI_API_TOKEN }}
+        skip-existing: true

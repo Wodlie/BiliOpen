@@ -16,15 +16,17 @@ import threading
 import time
 import traceback
 import types
-from BiliDrive import __version__
-from BiliDrive.bilibili import Bilibili
+import zlib
+import io
+from BiliOpen import __version__
+from BiliOpen.bilibili import Bilibili
 
 log = Bilibili._log
 
 bundle_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 
 default_url = lambda sha1: f"http://i0.hdslb.com/bfs/album/{sha1}.x-ms-bmp"
-meta_string = lambda url: ("bdrive://" + re.findall(r"[a-fA-F0-9]{40}", url)[0]) if re.match(r"^http(s?)://i0.hdslb.com/bfs/album/[a-fA-F0-9]{40}.x-ms-bmp$", url) else url
+meta_string = lambda url: ("biliopen://" + re.findall(r"[a-fA-F0-9]{40}", url)[0]) if re.match(r"^http(s?)://i0.hdslb.com/bfs/album/[a-fA-F0-9]{40}.x-ms-bmp$", url) else url
 size_string = lambda byte: f"{byte / 1024 / 1024 / 1024:.2f} GB" if byte > 1024 * 1024 * 1024 else f"{byte / 1024 / 1024:.2f} MB" if byte > 1024 * 1024 else f"{byte / 1024:.2f} KB" if byte > 1024 else f"{int(byte)} B"
 
 def bmp_header(data):
@@ -86,6 +88,7 @@ def image_upload(data, cookies):
         response = None
     return response
 
+
 def image_download(url):
     headers = {
         'Referer': "http://t.bilibili.com/",
@@ -122,12 +125,51 @@ def read_in_chunk(file_name, chunk_size=16 * 1024 * 1024, chunk_number=-1):
             else:
                 return
 
-def login_handle(args):
-    bilibili = Bilibili()
-    if bilibili.login(username=args.username, password=args.password):
-        bilibili.get_user_info()
-        with open(os.path.join(bundle_dir, "cookies.json"), "w", encoding="utf-8") as f:
-            f.write(json.dumps(bilibili.get_cookies(), ensure_ascii=False, indent=2))
+def load_cookies_from_file():
+    """Load cookies from cookie.txt file in HEADER STRING format"""
+    cookie_file = "cookie.txt"  # Use current working directory
+    
+    if not os.path.exists(cookie_file):
+        log("未找到cookie.txt文件，请创建该文件并填入有效的cookie")
+        log("cookie格式为HEADER STRING，例如：")
+        log("SESSDATA=xxx; bili_jct=xxx")
+        return None
+    
+    try:
+        with open(cookie_file, "r", encoding="utf-8") as f:
+            cookie_string = f.read().strip()
+        
+        if not cookie_string:
+            log("cookie.txt文件为空，请填入有效的cookie")
+            log("cookie格式为HEADER STRING，例如：")
+            log("SESSDATA=xxx; bili_jct=xxx")
+            return None
+        
+        # Parse cookie string into dictionary
+        cookies = {}
+        for cookie_pair in cookie_string.split(';'):
+            cookie_pair = cookie_pair.strip()
+            if '=' in cookie_pair:
+                key, value = cookie_pair.split('=', 1)
+                cookies[key.strip()] = value.strip()
+        
+        # Validate that essential cookies are present
+        essential_cookies = ['SESSDATA', 'bili_jct']
+        missing_cookies = [cookie for cookie in essential_cookies if cookie not in cookies]
+        
+        if missing_cookies:
+            log(f"cookie中缺少必要字段: {', '.join(missing_cookies)}")
+            log("请确保cookie包含SESSDATA, bili_jct等必要字段")
+            return None
+        
+        return cookies
+        
+    except Exception as e:
+        log(f"读取cookie.txt文件失败: {e}")
+        log("请检查文件格式是否正确，cookie格式为HEADER STRING")
+        return None
+
+
 
 def upload_handle(args):
     def core(index, block):
@@ -151,7 +193,7 @@ def upload_handle(args):
                     response = image_upload(full_block, cookies)
                     if response:
                         if response['code'] == 0:
-                            url = response['data']['image_url']
+                            url = response['data']['location']
                             log(f"分块{index + 1}/{block_num}上传完毕")
                             block_dict[index] = {
                                 'url': url,
@@ -209,11 +251,8 @@ def upload_handle(args):
         log(f"文件已于{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(history[first_4mb_sha1]['time']))}上传, 共有{len(history[first_4mb_sha1]['block'])}个分块")
         log(f"META URL -> {meta_string(url)}")
         return url
-    try:
-        with open(os.path.join(bundle_dir, "cookies.json"), "r", encoding="utf-8") as f:
-            cookies = json.loads(f.read())
-    except:
-        log("Cookies加载失败, 请先登录")
+    cookies = load_cookies_from_file()
+    if cookies is None:
         return None
     log(f"线程数: {args.thread}")
     done_flag = threading.Semaphore(0)
@@ -247,7 +286,7 @@ def upload_handle(args):
     for _ in range(10):
         response = image_upload(full_meta, cookies)
         if response and response['code'] == 0:
-            url = response['data']['image_url']
+            url = response['data']['location']
             log("元数据上传完毕")
             log(f"{meta_dict['filename']} ({size_string(meta_dict['size'])}) 上传完毕, 用时{time.time() - start_time:.1f}秒, 平均速度{size_string(meta_dict['size'] / (time.time() - start_time))}/s")
             log(f"META URL -> {meta_string(url)}")
@@ -266,11 +305,14 @@ def download_handle(args):
                     return
                 block = image_download(block_dict['url'])
                 if block:
-                    block = block[62:]
-                    if calc_sha1(block, hexdigest=True) == block_dict['sha1']:
+                    try:
+                        block_data = block[62:]
+                    except:
+                        return
+                    if calc_sha1(block_data, hexdigest=True) == block_dict['sha1']:
                         file_lock.acquire()
                         f.seek(block_offset(index))
-                        f.write(block)
+                        f.write(block_data)
                         file_lock.release()
                         log(f"分块{index + 1}/{len(meta_dict['block'])}下载完毕")
                         return
@@ -377,13 +419,9 @@ def history_handle(args):
 
 def main():
     signal.signal(signal.SIGINT, lambda signum, frame: os.kill(os.getpid(), 9))
-    parser = argparse.ArgumentParser(prog="BiliDrive", description="Make Bilibili A Great Cloud Storage!", formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("-v", "--version", action="version", version=f"BiliDrive version: {__version__}")
+    parser = argparse.ArgumentParser(prog="BiliOpen", description="Make Bilibili A Great Cloud Storage!", formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("-v", "--version", action="version", version=f"BiliOpen version: {__version__}")
     subparsers = parser.add_subparsers()
-    login_parser = subparsers.add_parser("login", help="log in to bilibili")
-    login_parser.add_argument("username", help="your bilibili username")
-    login_parser.add_argument("password", help="your bilibili password")
-    login_parser.set_defaults(func=login_handle)
     upload_parser = subparsers.add_parser("upload", help="upload a file")
     upload_parser.add_argument("file", help="name of the file to upload")
     upload_parser.add_argument("-b", "--block-size", default=4, type=int, help="block size in MB")
@@ -403,7 +441,7 @@ def main():
     shell = False
     while True:
         if shell:
-            args = shlex.split(input("BiliDrive > "))
+            args = shlex.split(input("BiliOpen > "))
             try:
                 args = parser.parse_args(args)
                 args.func(args)
