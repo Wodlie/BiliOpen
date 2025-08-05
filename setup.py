@@ -2,7 +2,32 @@
 # -*- coding: utf-8 -*-
 
 import setuptools
-import BiliOpen
+import os
+import re
+
+# Read version from __init__.py without importing the module
+def get_version():
+    init_file = os.path.join(os.path.dirname(__file__), "BiliOpen", "__init__.py")
+    with open(init_file, "r", encoding="utf-8") as f:
+        content = f.read()
+    version_match = re.search(r'^__version__\s*=\s*[\'"]([^\'"]*)[\'"]', content, re.MULTILINE)
+    if version_match:
+        return version_match.group(1)
+    raise RuntimeError("Unable to find version string.")
+
+# Read author and email from __init__.py without importing the module
+def get_author_info():
+    init_file = os.path.join(os.path.dirname(__file__), "BiliOpen", "__init__.py")
+    with open(init_file, "r", encoding="utf-8") as f:
+        content = f.read()
+    
+    author_match = re.search(r'^__author__\s*=\s*[\'"]([^\'"]*)[\'"]', content, re.MULTILINE)
+    email_match = re.search(r'^__email__\s*=\s*[\'"]([^\'"]*)[\'"]', content, re.MULTILINE)
+    
+    author = author_match.group(1) if author_match else "Unknown"
+    email = email_match.group(1) if email_match else "unknown@example.com"
+    
+    return author, email
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
@@ -10,12 +35,14 @@ with open("README.md", "r", encoding="utf-8") as fh:
 with open("requirements.txt", "r", encoding="utf-8") as fh:
     install_requires = fh.read().splitlines()
 
+author, email = get_author_info()
+
 setuptools.setup(
     name="BiliOpen",
-    version=BiliOpen.__version__,
+    version=get_version(),
     url="https://github.com/Wodlie/BiliOpen",
-    author=BiliOpen.__author__,
-    author_email=BiliOpen.__email__,
+    author=author,
+    author_email=email,
     classifiers=[
         "Development Status :: 4 - Beta",
         "Environment :: Console",
